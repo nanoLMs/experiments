@@ -47,15 +47,31 @@ class ModelExporter:
         self.cfg = TrainConfig()
         self.model = NanoMoEModel(self.cfg)
 
-        # Load trained weights
+        # Load trained weights with error handling for quantized models
         print_success(f"Loading model from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        if 'model' in checkpoint:
-            self.model.load_state_dict(checkpoint['model'])
-        elif 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Determine the state dict key
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+
+            # Check for 'base_model.' prefix and strip it if present
+            if any(k.startswith('base_model.') for k in state_dict.keys()):
+                print_warning("FP4 model detected. Stripping 'base_model.' prefix from state_dict.")
+                state_dict = {k.replace('base_model.', ''): v for k, v in state_dict.items()}
+
+            self.model.load_state_dict(state_dict, strict=True)
+            print_success("✅ Model loaded successfully")
+        except Exception as e:
+            print_error(f"Failed to load model: {e}")
+            print_warning("This is likely due to quantized weights incompatibility or a state_dict mismatch.")
+            print_warning("The model was trained with quantization but export expects unquantized, or the model architecture has changed.")
+            raise
 
         self.model.eval()
 
@@ -74,32 +90,30 @@ class ModelExporter:
             'source_checkpoint': str(self.checkpoint_path)
         }
 
-        # 1. PyTorch formats (FP32, FP16, 4-bit)
-        print_success("📦 Exporting PyTorch formats...")
-        sizes.update(self._export_pytorch_formats())
+        try:
+            # 1. PyTorch formats (FP32, FP16)
+            print_success("📦 Exporting PyTorch formats...")
+            sizes.update(self._export_pytorch_formats())
 
-        # 2. Hugging Face format
-        print_success("🤗 Exporting Hugging Face format...")
-        sizes.update(self._export_huggingface_format())
+            # 2. Hugging Face format
+            print_success("🤗 Exporting Hugging Face format...")
+            sizes.update(self._export_huggingface_format())
 
-        # 3. Mobile formats
-        print_success("📱 Exporting mobile formats...")
-        sizes.update(self._export_mobile_formats())
+            # 3. Mobile formats
+            print_success("📱 Exporting mobile formats...")
+            sizes.update(self._export_mobile_formats())
 
-        # 4. ONNX formats (if available)
-        if HAS_ONNX:
-            print_success("🔄 Exporting ONNX formats...")
-            sizes.update(self._export_onnx_formats())
-        else:
-            print_warning("ONNX not available - skipping ONNX export")
+            # 4. Create comprehensive summary with Rich display
+            print_export_summary(sizes)
+            self._create_deployment_guide(sizes, export_info)
 
-        # 5. Specialized formats
-        print_success("⚡ Exporting specialized formats...")
-        sizes.update(self._export_specialized_formats())
+        except Exception as e:
+            print_error(f"Export failed: {e}")
+            print_warning("This might be due to quantized model incompatibility")
+            print_warning("Try training without quantization first")
 
-        # 6. Create comprehensive summary with Rich display
-        print_export_summary(sizes)
-        self._create_deployment_guide(sizes, export_info)
+            # Create minimal export
+            sizes = self._create_minimal_export()
 
         return sizes
 
@@ -546,6 +560,25 @@ Export completed: {export_info['export_timestamp']}
 
         # The Rich export summary is called earlier in export_all_formats()
         # This space left for any additional summary logic if needed
+
+    def _create_minimal_export(self):
+        """Create minimal export when full export fails."""
+        sizes = {}
+
+        # Just save the basic model state
+        try:
+            basic_path = self.output_dir / "model_basic.pt"
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'config': self.cfg.__dict__,
+                'export_note': 'Basic export due to quantization incompatibility'
+            }, basic_path)
+            sizes['basic_model'] = self._get_file_size(basic_path)
+            print_success(f"✅ Basic model exported: {self._format_size(sizes['basic_model'])}")
+        except Exception as e:
+            print_error(f"Even basic export failed: {e}")
+
+        return sizes
 
 
 def export_final_models(checkpoint_path: str, output_dir: str = "exported_models"):

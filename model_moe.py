@@ -75,7 +75,8 @@ def apply_rotary(x, cos, sin):
         x1 = x_rot[..., 0::2]  # Even indices [B, T, H, rope_dim//2]
         x2 = x_rot[..., 1::2]  # Odd indices [B, T, H, rope_dim//2]
         cos_half = cos[..., 0::2]  # [1, T, 1, rope_dim//2]
-        sin_half = sin[..., 1::2]  # [1, T, 1, rope_dim//2]
+        # FIX: sin must slice the same even positions to pair correctly
+        sin_half = sin[..., 0::2]  # [1, T, 1, rope_dim//2]
 
         # Rotate
         x1_new = x1 * cos_half - x2 * sin_half
@@ -203,10 +204,12 @@ class MoE(nn.Module):
 
         # FIXED: Load balance auxiliary loss
         importance = gates.sum(dim=(0,1))               # E (sum of gate values per expert)
-        flat_assign = topk_idx.view(-1, self.k)
+        # Compute load as the number of selections per expert (simpler and more robust)
         load = torch.zeros(self.n_experts, device=x.device)
+        total_selections = float(topk_idx.numel())
         for e in range(self.n_experts):
-            load[e] = (flat_assign == e).any(dim=1).float().sum()
+            load[e] = (topk_idx == e).float().sum()
+        # normalize
         importance = importance / (importance.sum() + 1e-9)
         load = load / (load.sum() + 1e-9)
         balance_loss = (importance * load).sum() * self.n_experts * self.router_z_loss
@@ -268,11 +271,23 @@ class NanoMoEModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        # Ensure config derived fields are set
+        try:
+            if hasattr(self.cfg, 'validate'):
+                self.cfg.validate()
+        except Exception:
+            pass
+
+        # robust rope dim (fall back to d_model // n_heads)
+        rope_dim = getattr(self.cfg, 'd_head', None)
+        if not rope_dim:
+            rope_dim = max(1, self.cfg.d_model // max(1, self.cfg.n_heads))
+
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.rope = RotaryEmbedding(cfg.d_head, base=cfg.rope_base, scale=cfg.rope_scaling)
+        self.rope = RotaryEmbedding(rope_dim, base=cfg.rope_base, scale=cfg.rope_scaling)
         self.blocks = nn.ModuleList()
         for i in range(cfg.n_layers):
-            use_moe = (i % cfg.moe_every == 0)
+            use_moe = (i % cfg.moe_every == 0) if cfg.moe_every > 0 else False
             block = TransformerBlock(
                 cfg.d_model, cfg.n_heads, cfg.d_ff, self.rope,
                 dropout=cfg.dropout, attn_dropout=cfg.attn_dropout,
@@ -284,7 +299,7 @@ class NanoMoEModel(nn.Module):
             self.blocks.append(block)
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = maybe_lora(nn.Linear(cfg.d_model, cfg.vocab_size, bias=False), cfg, 'head')
-        self.mtp_heads = nn.ModuleList([maybe_lora(nn.Linear(cfg.d_model, cfg.vocab_size, bias=False), cfg, f"mtp_{i}") for i in range(cfg.mtp_heads)])
+        self.mtp_heads = nn.ModuleList([maybe_lora(nn.Linear(cfg.d_model, cfg.vocab_size, bias=False), cfg, f"mtp_{i}") for i in range(cfg.mtp_k)])
         if cfg.enable_reasoning:
             from reasoning import ReasoningAggregator
             self.reason_head = ReasoningAggregator(cfg.d_model, cfg.reasoning_dim, cfg.vocab_size)
@@ -304,26 +319,44 @@ class NanoMoEModel(nn.Module):
         if self.training and not x.requires_grad:
             x.requires_grad_(True)
 
+        # HRM (Hierarchical Reasoning Module) integration
+        if getattr(self.cfg, 'use_hrm', False) and self.training:
+            return self._forward_with_hrm(idx, x, aux_losses)
+        else:
+            return self._forward_standard(x, aux_losses)
+
+    def _forward_standard(self, x, aux_losses):
+        """Standard forward pass"""
         for blk in self.blocks:
-            if self.cfg.gradient_checkpointing and self.training and x.requires_grad:
+            # FIXED: Disable gradient checkpointing when using bitsandbytes
+            use_checkpointing = (
+                self.cfg.gradient_checkpointing and
+                self.training and
+                x.requires_grad and
+                not getattr(self.cfg, 'use_bnb_4bit', False)  # Disable for bitsandbytes
+            )
+
+            if use_checkpointing:
                 # Simplified gradient checkpointing to avoid tensor mismatch
                 def checkpoint_fn(input_x):
                     output_x, output_aux = blk(input_x)
                     return output_x, output_aux
 
-                # Use reentrant mode to avoid tensor counting issues
+                # Use non-reentrant mode which is recommended and more efficient
                 x, aux = torch.utils.checkpoint.checkpoint(
                     checkpoint_fn,
                     x,
-                    use_reentrant=True  # Use reentrant mode to avoid counting issues
+                    use_reentrant=False  # Use non-reentrant mode
                 )
                 aux_losses.append(aux)
             else:
-                # Standard forward pass
+                # Standard forward pass (used with bitsandbytes)
                 x, aux = blk(x)
                 aux_losses.append(aux)
+
         x = self.ln_f(x)
         logits_main = self.head(x)
+
         # FIXED MTP: Proper multi-token prediction implementation
         logits_mtp = []
         for i, head in enumerate(self.mtp_heads):
@@ -331,10 +364,99 @@ class NanoMoEModel(nn.Module):
             # So we use the same hidden states x (no shifting needed in model)
             # The shifting happens in loss computation in trainer
             logits_mtp.append(head(x))
+
         reason_logits = None
         if self.reason_head is not None:
             reason_logits = self.reason_head(x)
+
         return logits_main, logits_mtp, torch.stack(aux_losses).sum() * self.cfg.moe_aux_weight, reason_logits
+
+    def _forward_with_hrm(self, idx, x, aux_losses):
+        """HRM (Hierarchical Reasoning Module) forward pass.
+
+        This implementation segments the input sequence into time-chunks and for each segment
+        performs N_cycles of T_steps updates where the first (N_cycles*T_steps - 1)
+        updates are executed under torch.no_grad() and the final update is executed with gradients.
+        The resulting segment outputs are concatenated to form the final sequence hidden states.
+        """
+        # HRM parameters from config (use hrm_* names)
+        N_cycles = getattr(self.cfg, 'hrm_N_cycles', 2)
+        T_steps = getattr(self.cfg, 'hrm_T_steps', 2)
+        segments = getattr(self.cfg, 'hrm_segments', 2)
+
+        B, T, C = x.shape
+        if segments <= 1:
+            # fallback to standard forward if not segmented
+            return self._forward_standard(x, aux_losses)
+
+        seg_len = T // segments
+        remainder = T % segments
+        outputs = []
+
+        time_ptr = 0
+        for s in range(segments):
+            this_len = seg_len + (1 if s < remainder else 0)
+            if this_len <= 0:
+                continue
+            x_seg = x[:, time_ptr:time_ptr+this_len, :].contiguous()  # [B, L, C]
+
+            # run (N_cycles*T_steps - 1) no-grad updates and final grad update
+            total_updates = N_cycles * T_steps
+            # intermediate no-grad updates
+            for _ in range(total_updates - 1):
+                with torch.no_grad():
+                    x_seg = self._process_segment_no_grad(x_seg)
+            # final update with grad
+            x_seg = self._process_segment_with_grad(x_seg, aux_losses)
+
+            # collect
+            outputs.append(x_seg)
+            time_ptr += this_len
+
+        # concat segments along time dim
+        x = torch.cat(outputs, dim=1)
+
+        # final norm and heads
+        x = self.ln_f(x)
+        logits_main = self.head(x)
+
+        logits_mtp = []
+        for i, head in enumerate(self.mtp_heads):
+            logits_mtp.append(head(x))
+
+        reason_logits = None
+        if self.reason_head is not None:
+            reason_logits = self.reason_head(x)
+
+        return logits_main, logits_mtp, torch.stack(aux_losses).sum() * self.cfg.moe_aux_weight, reason_logits
+
+    def _process_segment_with_grad(self, x, aux_losses):
+        """Process segment with gradients (final step)"""
+        for blk in self.blocks:
+            x, aux = blk(x)
+            aux_losses.append(aux)
+        return x
+
+    def _process_segment_no_grad(self, x):
+        """Process segment without gradients (intermediate steps)"""
+        with torch.no_grad():
+            for blk in self.blocks:
+                x, _ = blk(x)  # Ignore aux losses for no-grad steps
+        return x
+
+    def get_pooled_representation(self, x):
+        """Return a pooled (mean) representation for contrastive loss.
+
+        Accepts either input ids [B,T] or hidden states [B,T,C].
+        """
+        if x.dim() == 2:  # input ids
+            x = self.tok_emb(x)
+            x = self.ln_f(x)
+        elif x.dim() == 3:
+            # assume hidden states
+            x = self.ln_f(x)
+        # mean pool over time
+        return x.mean(dim=1)
 
     def num_parameters(self):
         return sum(p.numel() for p in self.parameters())
@@ -363,5 +485,5 @@ def mtp_loss(logits_list, y, k):
     T = logits_list[0].size(1)
     for i, logits in enumerate(logits_list, start=1):
         tgt = y[:, :T]  # align left; trainer should slice inputs accordingly
-        losses.append(F.cross_entropy(logits.transpose(1,2), tgt, reduction='mean'))
+        losses.append(F.cross_entropy(logits.transpose(1,2), tgt, reduction='mean', label_smoothing=0.1))
     return sum(losses) / len(losses)

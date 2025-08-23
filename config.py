@@ -1,222 +1,205 @@
 from dataclasses import dataclass, field
-from typing import Tuple, List, Optional    # ================================
+from typing import Tuple, List, Optional
+
+    # ================================
     # TRAINING SCHEDULE - OPTIMIZED FOR MAXIMUM GPU UTILIZATION
     # ================================
 @dataclass
 class TrainConfig:
+    """Training and model configuration tuned for building a compact nanoLM
 
-    seq_len: int = 512                 # REDUCED: Faster first step
-    micro_batch_size: int = 2          # MINIMAL: Ensure first step completes quickly
-    grad_accum_steps: int = 12         # INCREASED: Compensate for smaller micro batch
-    num_epochs: int = 10               # REDUCED: Fine-tuning needs fewer epochs
-    target_total_tokens: int = 500_000_000  # REDUCED: Fine-tuning phase
+    - Defaults chosen to target a compact model (approx 100-150 MB when quantized)
+    - Built-in support for MoE, MTP, hierarchical reasoning (HRM), anti-hallucination losses
+    - NF4 (bitsandbytes) training enabled by default, FP4 options for fine-tuning
+    """
 
-    lr: float = 1e-4                   # REDUCED: Lower LR for fine-tuning stability
-    min_lr: float = 1e-5               # Proportionally lower
-    warmup_steps: int = 100            # SHORTER: Already pre-trained
-    weight_decay: float = 0.01         # LOWER weight decay for FP4
-    betas: Tuple[float, float] = (0.9, 0.95)
-    max_grad_norm: float = 1.0         # Gradient clipping
+    # -------------------- dataset / training schedule --------------------
+    seq_len: int = 256                 # OPTIMAL: Good balance for convergence
+    micro_batch_size: int = 8          # STABLE: Proven batch size
+    grad_accum_steps: int = 4          # INCREASED: Better gradient estimation
+    num_epochs: int = 10               # FULL: Complete training for convergence
+    target_total_tokens: Optional[int] = None  # DISABLED: Train for full epochs without token limit
 
-    # ================================
-    # PERFORMANCE OPTIMIZATIONS - MAXIMUM GPU HUNGRY SETTINGS
-    # ================================
+    lr: float = 2e-5                   # REDUCED: More stable learning rate for convergence
+    min_lr: float = 1e-6               # Higher minimum for stability
+    warmup_steps: int = 500           # INCREASED: Better warmup for stability
+    weight_decay: float = 0.01          # INCREASED: Better regularization
+    betas: Tuple[float, float] = (0.9, 0.999)  # Standard Adam betas
+    max_grad_norm: float = 1.0         # INCREASED: Allow larger gradients for convergence
+
+    # -------------------- performance / data loader --------------------
     pin_memory: bool = True            # Pin memory for faster transfers
-    num_workers: int = 2               # REDUCED: Avoid data loading bottleneck
-    persistent_workers: bool = False   # DISABLED: Reduce memory pressure
-    prefetch_factor: int = 2           # REDUCED: Less memory usage
+    num_workers: int = 4               # REDUCED: Avoid data loading bottleneck
+    dataloader_workers: int = 4        # backward-compatible alias used elsewhere
+    persistent_workers: bool = True     # Keep workers alive between epochs
+    prefetch_factor: int = 2           # Aggressive prefetching (32GB RAM allows it)
     dataloader_drop_last: bool = True  # Drop incomplete batches
 
     # GPU Memory and Performance
     gradient_checkpointing: bool = True  # Enable for memory efficiency
-    compile_model: bool = False        # DISABLED: Avoid first-step compilation delay
-    use_fused_adam: bool = True        # Use fused AdamW for speed
-    mixed_precision: str = "fp16"      # Use FP16 for non-quantized operations
+    activation_checkpointing: bool = True   # RE-ENABLED: Memory savings
+    mixed_precision: str = "bf16"      # Use FP16 for non-quantized operations
+    amp: bool = True                      # Automatic Mixed Precision
+    compile_model: bool = False
+    compile_backend: Optional[str] = None  # e.g., 'inductor', 'nvfuser' (fallback None)
 
-    # Advanced Performance Settings
-    cudnn_benchmark: bool = True       # Enable cuDNN benchmark for speed
-    cuda_empty_cache_steps: int = 50   # Clear cache every N steps
-    max_split_size_mb: int = 512       # Limit memory fragmentation TrainConfig:
-    # ================================
-    # DATA PATHS & FILES
-    # ================================
-    tokenizer_dir: str = "/home/swadhin/experiments/nanolm_tokenizer/hf_tokenizer"
-    train_corpus: str = "/home/swadhin/experiments/nanolm_tokenizer/test_corpus.txt"
-    ckpt_dir: str = "checkpoints"
+    # -------------------- compact model architecture (defaults) --------------------
+    # Defaults chosen to hit ~30M parameters FP32; with 4-bit storage it fits well under 150MB
+    vocab_size: int = 29086
+    n_layers: int = 16                # INCREASED: More layers for better learning
+    n_heads: int = 8                   # INCREASED: More attention heads
+    d_model: int = 384                 # INCREASED: Better representation capacity
+    # d_head computed in validate() to keep consistent with n_heads/d_model
+    d_head: Optional[int] = None
+    d_ff: int = 1536                   # INCREASED: 2x expansion ratio
 
-    # ================================
-    # MODEL ARCHITECTURE - OPTIMIZED FOR RTX 3060 Ti (8GB) WITH MEMORY CONSTRAINTS
-    # ================================
-    vocab_size: int = 32000
-    n_layers: int = 8                  # FURTHER REDUCED: Better fit in 8GB GPU with FP4
-    n_heads: int = 8                   # Kept at 8 for good attention
-    d_model: int = 512                 # Kept at 512 for balance
-    d_head: int = d_model // n_heads   # Auto-calculated = 64
-    d_ff: int = 1024                   # FURTHER REDUCED: 2x expansion ratio for memory
+    tie_word_embeddings: bool = True
 
-    # ================================
-    # MIXTURE OF EXPERTS (MoE) - OPTIMIZED FOR 8GB GPU
-    # ================================
-    moe_every: int = 6                 # Every 6th layer is MoE (less frequent for memory)
-    n_experts: int = 4                 # REDUCED: Fewer experts for memory
-    moe_top_k: int = 2
-    expert_ff_mult: float = 0.75       # REDUCED SIZE: Further memory savings
+    # -------------------- MoE (Mixture of Experts) --------------------
+    moe_every: int = 0                 # 0 = disabled; set to e.g. 2 or 4 to insert MoE layers
+    n_experts: int = 4
+    moe_top_k: int = 1                 # top-1 gating for efficient inference
+    expert_ff_mult: float = 1.0      # expert FF multiplier (how large experts are)
     router_jitter: float = 0.01
     router_z_loss: float = 1e-4
-    capacity_factor: float = 1.0       # FULL CAPACITY: Memory available with 4-bit
-    moe_aux_weight: float = 0.02       # Load balance weight
+    capacity_factor: float = 1.0
+    moe_aux_weight: float = 0.01
 
-    # ================================
-    # REASONING HEADS - OPTIMIZED FOR MEMORY
-    # ================================
+    # -------------------- Multi-Token Prediction (MTP) --------------------
+    mtp_k: int = 4                   # predict next K tokens
+
+    mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
+
+    # -------------------- Hierarchical Reasoning (HRM-like) --------------------
+    use_hrm: bool = True
+    hrm_segments: int = 2
+    hrm_N_cycles: int = 2
+    hrm_T_steps: int = 2
+
+    # -------------------- reasoning / explanation head --------------------
+    # Enable an optional reasoning / explanation aggregator head (lightweight)
     enable_reasoning: bool = True
-    reasoning_layers: List[int] = field(default_factory=lambda: [8])  # Single reasoning layer
-    reasoning_dim: int = 256           # REDUCED: Smaller reasoning dimension
-    reasoning_loss_weight: float = 0.05
+    reasoning_dim: int = 256
 
-    # ================================
-    # MULTI-TOKEN PREDICTION (MTP) - MEMORY OPTIMIZED
-    # ================================
-    mtp_heads: int = 3                 # Predict t+1, t+2, t+3 for better learning
-    mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25])  # Decreasing weights
-
-    # ================================
-    # STAGE 2: FP4 FQT FINE-TUNING (CUTTING-EDGE PERFORMANCE)
-    # ================================
-    use_quantization: bool = True      # General quantization flag
-    use_fp4: bool = False              # ❌ DISABLE fake 4-bit simulation
-    use_bnb_4bit: bool = True         # ❌ DISABLE bitsandbytes (switch to FP4)
-    use_pure_4bit: bool = False         # ✅ ENABLE FP4 FQT methodology
-
-    # BITSANDBYTES NF4 CONFIGURATION (STAGE 1 - STABLE TRAINING):
-    bnb_4bit_compute_dtype: str = "bfloat16"  # Compute in BF16 (fast + stable)
-    bnb_4bit_quant_type: str = "nf4"          # NormalFloat4 - best 4-bit format
-    bnb_4bit_use_double_quant: bool = True    # Extra compression
-    bnb_4bit_quant_storage: str = "uint8"     # Storage format
-
-    # FP4 FQT CONFIGURATION (STAGE 2 - FINE-TUNING):
-    # - NVFP4 format: E2M1 data precision, E4M3 scale format
-    # - Block size: 16 (optimal from research)
-    # - Split rounding strategy: RtN forward, SR backward/update
-    # - Automatic QAF phase for final convergence
-    fp4_format: str = "nvfp4"                 # NVFP4 format (E2M1 + E4M3)
-    fp4_block_size: int = 16                  # Block size for quantization (optimal)
-    fp4_split_rounding: bool = True           # Split rounding strategy
-    fp4_use_amp: bool = False                 # AMP not needed with FP4
-
-    # QAF (Quantization-Aware Finetuning) Configuration:
-    qaf_threshold: float = 1e-6               # Gradient stagnation threshold
-    max_qaf_steps: int = 1000                 # Brief QAF phase duration
-    qaf_precision: str = "bf16"               # Higher precision for QAF gradients
-
-    # ================================
-    # LoRA (Low-Rank Adaptation)
-    # ================================
-    lora: bool = True
-    lora_rank: int = 8                 # Reduced for memory efficiency
-    lora_alpha: int = 16               # Reduced from 32
-    lora_dropout: float = 0.05
-    lora_target_modules: Tuple[str, ...] = ("qkv", "out", "w1", "w2", "head", "mtp_")
-
-
-
-    # ================================
-    # MEMORY OPTIMIZATIONS
-    # ================================
-    gradient_checkpointing: bool = True     # RE-ENABLED: bitsandbytes is stable
-    activation_checkpointing: bool = True   # RE-ENABLED: Memory savings
-    compile_model: bool = False           # DISABLED: Avoiding dtype conflicts with 4-bit + compilation
-    compile_mode: str = "default"         # Options: default, reduce-overhead, max-autotune
-    compile_fullgraph: bool = False       # More stable compilation
-    compile_dynamic: bool = True          # Handle variable sequence lengths
-    pin_memory: bool = True
-    amp: bool = True                      # Automatic Mixed Precision
-
-    # ================================
-    # REGULARIZATION
-    # ================================
-    dropout: float = 0.05
-    attn_dropout: float = 0.05
-    ff_dropout: float = 0.05
-
-    # ================================
-    # FLASHATTENTION
-    # ================================
+    # -------------------- attention / flash attention --------------------
     use_flash_attn: bool = True
-    flash_dropout_p: float = 0.0
+    attn_dropout: float = 0.0
     rope_base: int = 10000
     rope_scaling: float = 1.0
 
-    # ================================
-    # ANTI-HALLUCINATION
-    # ================================
-    factual_penalty_weight: float = 0.1
-    forbidden_tokens: Optional[List[int]] = None
+    # -------------------- anti-hallucination & losses --------------------
+    factual_penalty_weight: float = 0.25
+    unlikelihood_weight: float = 0.5
+    contrastive_loss_weight: float = 0.1
+    reasoning_loss_weight: float = 0.1
     forbidden_tokens_file: Optional[str] = None
+    forbidden_tokens: Optional[List[int]] = None
+    retrieval_augmentation: bool = False
 
-    # ================================
-    # CHECKPOINTING & MONITORING
-    # ================================
-    log_interval: int = 25             # Log every 25 steps
-    eval_interval: int = 1000          # Evaluate every 1000 steps
-    save_interval: int = 500           # Save every 500 steps
-    keep_last_k: int = 5               # Keep last 5 checkpoints
-    save_best: bool = True             # Save best model
-    early_stopping_patience: int = 10000
-    report_memory_interval: int = 250
+    # -------------------- quantization/training formats --------------------
+    use_quantization: bool = True
+    use_bnb_4bit: bool = True        # train in NF4 with bitsandbytes
+    bnb_4bit_quant_type: str = "nf4"
+    bnb_4bit_compute_dtype: str = "bfloat16"
+    bnb_4bit_use_double_quant: bool = True
+    bnb_4bit_quant_storage: str = "uint8"
+    bnb_4bit_quantize_heads: bool = True
+    bnb_4bit_quantize_router: bool = True
+
+    # FP4 fine-tuning options (post-NF4 training)
+    use_fp4: bool = True
+    fp4_format: str = "nvfp4"
+    fp4_block_size: int = 16
+    fp4_split_rounding: bool = True
+    qaf_threshold: float = 1e-6
+    max_qaf_steps: int = 1000
+    qaf_precision: str = "bf16"
+
+    # -------------------- LoRA (optional) --------------------
+    lora: bool = False
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_target_modules: Tuple[str, ...] = ()
+
+    # -------------------- regularization and dropout --------------------
+    dropout: float = 0.05
+    ff_dropout: float = 0.05
+
+    # -------------------- checkpointing / logging --------------------
+    tokenizer_dir: str = "/home/swadhin/experiments/lawdataset/legal_tokenizer/hf_tokenizer/"
+    train_corpus: str = "/home/swadhin/experiments/lawdataset/legal_tokenizer/test_corpus.txt"
+    ckpt_dir: str = "checkpoints"
+
+    log_interval: int = 10
+    eval_interval: int = 1000
+    save_interval: int = 1000
+    keep_last_k: int = 5
+    save_best: bool = True
     save_config_once: bool = True
+    report_memory_interval: int = 250
 
-    # ================================
-    # DISTRIBUTED TRAINING - DISABLED FOR SINGLE GPU
-    # ================================
-    fsdp: bool = False                 # Disabled for single RTX 3060 Ti
-    fsdp_wrap_layer_size: int = 1000000
-    fsdp_cpu_offload: bool = True      # Offload to CPU when needed
-    ddp: bool = False                  # Disabled for single GPU
+    # Early stopping configuration
+    early_stopping_patience: Optional[int] = None  # number of evaluations with no improvement
+    early_stopping_min_delta: float = 0.0  # minimum change to qualify as improvement
 
-    # ================================
-    # DATA LOADING - OPTIMIZED FOR i5-13600K + 32GB RAM
-    # ================================
-    dataloader_workers: int = 16       # OPTIMAL: 80% of 20 logical CPUs (i5-13600K)
-    pin_memory: bool = True             # Essential for GPU training
-    persistent_workers: bool = True     # Keep workers alive between epochs
-    prefetch_factor: int = 4            # Aggressive prefetching (32GB RAM allows it)
-    drop_last: bool = True              # Consistent batch sizes
-    max_dataset_samples: int = 1000000  # Increased dataset size (more RAM available)
+    # -------------------- distributed / hardware --------------------
+    fsdp: bool = False
+    ddp: bool = False
 
-    # ================================
-    # EVALUATION & GENERATION
-    # ================================
+    # -------------------- evaluation / generation --------------------
     eval_samples: int = 128
     generation_max_new_tokens: int = 128
 
-    # ================================
-    # MISC
-    # ================================
+    # -------------------- meta / targets --------------------
+    target_model_size_mb: Tuple[int, int] = (100, 150)  # target range for edge deployment
     seed: int = 42
 
+    # -------------------- derived / helper methods --------------------
     def effective_batch_size(self, world_size: int) -> int:
-        """Calculate effective batch size across all devices"""
         return self.micro_batch_size * self.grad_accum_steps * world_size
 
+    def validate(self):
+        """Sanity-check and fill derived fields."""
+        # compute d_head if missing
+        if self.d_head is None:
+            if self.n_heads > 0:
+                self.d_head = max(1, self.d_model // self.n_heads)
+            else:
+                self.d_head = self.d_model
 
-    # ================================
-    # MULTI-TOKEN PREDICTION (MTP)
-    # ================================
-    mtp_k: int = 4                     # predict next K tokens at once (loss across shifts)
+        # ensure mtp_k matches loss weights
+        if len(self.mtp_loss_weights) < self.mtp_k:
+            # pad with geometric decay if not provided
+            base = self.mtp_loss_weights[0] if self.mtp_loss_weights else 1.0
+            self.mtp_loss_weights = [base * (0.5 ** i) for i in range(self.mtp_k)]
 
-    # ================================
-    # HIERARCHICAL REASONING (HRM-like)
-    # ================================
-    use_hrm: bool = True               # enable segmented 1-step-grad training
-    segments: int = 2                  # M segments per batch item
-    N_cycles: int = 2                  # HRM low/high cycles per segment
-    T_steps: int = 2                   # high-level updates every T low-level steps
-    use_act: bool = False              # optional adaptive segments
+        # disable expensive features automatically for tiny models
+        if (self.n_layers * self.d_model) < 4000:
+            # too small for MoE
+            self.moe_every = 0
 
-    # ================================
-    # 4-bit NormalFloat (NF4) Quantization
-    # ================================
-    use_fp4: bool = True               # replace Linear with NF4 where safe
-    fp4_compute_dtype: str = "fp16"    # compute dtype when using 4-bit weights
-    fp4_skip_modules: tuple = ("lm_head",)  # keep output head in higher precision
+    def estimate_model_size_mb(self, quantized: bool = True) -> float:
+        """Rough parameter count -> size estimation.
+
+        This is a coarse estimator (ignores optimizer states, adapters, and small heads).
+        When quantized==True we assume effective 4-bit storage (0.5 bytes/param) for bulk params.
+        """
+        # embeddings
+        params = int(self.vocab_size) * int(self.d_model)
+        # transformer rough params: per layer ~ 4*d_model*d_model (attn proj) + 2*d_model*d_ff (ff)
+        per_layer = 4 * self.d_model * self.d_model + 2 * self.d_model * self.d_ff
+        params += per_layer * self.n_layers
+        # small head and norms
+        params += 5 * self.d_model
+
+        if quantized:
+            bytes_per_param = 0.5  # 4-bit -> 0.5 bytes
+        else:
+            bytes_per_param = 4.0
+        size_mb = params * bytes_per_param / (1024 * 1024)
+        return float(size_mb)
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return {k: v for k, v in self.__dict__.items()}

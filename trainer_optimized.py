@@ -3,10 +3,12 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import AdamW
 from transformers import PreTrainedTokenizerFast
+from contextlib import nullcontext
 
 # Fix tokenizer parallelism warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from config import TrainConfig
+from config_simple_loss_debug import SimpleLossDebugConfig
 from model_moe import NanoMoEModel
 
 # Import FP4 FQT implementation
@@ -22,6 +24,7 @@ try:
     HAS_LEGACY_4BIT = True
 except ImportError:
     HAS_LEGACY_4BIT = False
+
 from data_loader import create_dataloader
 from anti_hallu import LogitConstraint
 from schedule import cosine_with_warmup
@@ -32,8 +35,15 @@ from rich_output import (
     print_export_summary, print_error, print_warning, print_success,
     TrainingMetrics, check_rich_installation
 )
+from loss_tracker import LossTracker
 
-# Remove fake fp4_quant import - we use real bitsandbytes now
+# Import AMP components with fallbacks
+try:
+    from torch.cuda.amp import GradScaler, autocast as autocast_cuda
+    HAS_AMP = True
+except ImportError:
+    HAS_AMP = False
+    autocast_cuda = None
 
 try:
     import bitsandbytes as bnb
@@ -66,37 +76,42 @@ def init_distributed():
 
 
 def get_optimizer(cfg, model):
-    """Get optimizer - use bitsandbytes for 4-bit quantized models"""
+    """Get optimizer - use bitsandbytes AdamW8bit for 4-bit quantized models"""
     params = [p for p in model.parameters() if p.requires_grad]
 
-    # Try to use bitsandbytes optimizer for 4-bit models
+    # Use bitsandbytes optimizer for 4-bit models
     if cfg.use_bnb_4bit and HAS_BNB:
         try:
-            optim_cls = bnb.optim.AdamW8bit
-            print("🔧 Using AdamW8bit optimizer for 4-bit model")
-            return optim_cls(
+            print("🔧 Using BitsAndBytes AdamW8bit optimizer for NF4 model")
+            optimizer = bnb.optim.AdamW8bit(
                 params,
                 lr=cfg.lr,
                 betas=cfg.betas,
                 weight_decay=cfg.weight_decay,
-                # FIXED: Remove optim_bits parameter - AdamW8bit handles this internally
-                min_8bit_size=4096,  # Only quantize large tensors
+                eps=1e-8,
+                min_8bit_size=4096,  # Only quantize large optimizer states
                 percentile_clipping=100,  # Disable percentile clipping for stability
                 block_wise=True  # Enable block-wise quantization for memory efficiency
             )
+            print("   ✅ AdamW8bit optimizer created successfully")
+            print("   ✅ Optimizer states will also be 8-bit quantized")
+            return optimizer
+
         except Exception as e:
-            print(f"⚠️ AdamW8bit failed ({e})")
-            print("🔧 Falling back to regular AdamW (works fine with 4-bit models)")
+            print(f"⚠️ AdamW8bit failed: {e}")
+            print("🔧 Falling back to regular AdamW (still works with NF4 model)")
 
     # Standard AdamW (works perfectly with 4-bit models)
-    print("🔧 Using regular PyTorch AdamW optimizer")
-    return AdamW(
+    print("🔧 Using standard PyTorch AdamW optimizer")
+    optimizer = AdamW(
         params,
         lr=cfg.lr,
         betas=cfg.betas,
         weight_decay=cfg.weight_decay,
         eps=1e-8
     )
+    print("   ✅ Standard AdamW optimizer created")
+    return optimizer
 
 
 def maybe_fsdp_wrap(cfg, model):
@@ -119,7 +134,7 @@ def evaluate(model, tokenizer, cfg, device):
 
     results = []
     total_eval_loss = 0.0
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100, label_smoothing=0.1)
 
     with torch.no_grad():
         # Generation evaluation
@@ -156,11 +171,11 @@ def evaluate(model, tokenizer, cfg, device):
     return results, total_eval_loss
 
 
-def train():
+def train(config_class=TrainConfig):
     # Check Rich installation
     check_rich_installation()
 
-    cfg = TrainConfig()
+    cfg = config_class()
     distributed, rank, world = init_distributed()
     setup_seed(cfg.seed + rank)
 
@@ -184,8 +199,13 @@ def train():
             print_warning("Please run 'python analyze_tokenizer.py' first to check available tokenizers")
         return
 
+    # DYNAMICALLY SET VOCAB SIZE from tokenizer to prevent index errors
+    if cfg.vocab_size != len(tokenizer):
+        if rank == 0:
+            print_warning(f"Config vocab_size ({cfg.vocab_size}) doesn't match tokenizer ({len(tokenizer)}). Extending model embeddings.")
+        cfg.vocab_size = len(tokenizer)
+
     if cfg.forbidden_tokens_file and os.path.exists(cfg.forbidden_tokens_file):
-        import json
         with open(cfg.forbidden_tokens_file) as f:
             cfg.forbidden_tokens = json.load(f)
 
@@ -246,21 +266,50 @@ def train():
         }
         print_config_summary(config_dict)
 
-    # BITSANDBYTES 4-BIT QUANTIZATION: Use optimizer-based approach
+    # -------------------- BITSANDBYTES 4-BIT QUANTIZATION --------------------
+    # Ensure we only attempt real NF4 quantization when CUDA + bitsandbytes are available
+    quantization_success = False
     if cfg.use_bnb_4bit and HAS_BNB:
-        if rank == 0:
-            print_success("🔥 Applying REAL bitsandbytes NF4 quantization")
-            print(f"   • Quant type: {cfg.bnb_4bit_quant_type}")
-            print(f"   • Compute dtype: {cfg.bnb_4bit_compute_dtype}")
-            print(f"   • Double quant: {cfg.bnb_4bit_use_double_quant}")
+        if not torch.cuda.is_available():
+            if rank == 0:
+                print_warning("⚠️ BitsAndBytes NF4 was requested but no CUDA device detected. Disabling NF4 to avoid CUDA hangs.")
+                print_warning("   Set cfg.use_bnb_4bit=False to force CPU training or enable CUDA.")
+            cfg.use_bnb_4bit = False
+            quantization_success = False
+        else:
+            # Move model to CUDA before applying bnb replacements to ensure ops bind to the right device/context
+            model.to(device)
+            if rank == 0:
+                print_success("🔥 Applying REAL bitsandbytes NF4 quantization")
+                print(f"   • Quant type: {cfg.bnb_4bit_quant_type}")
+                print(f"   • Compute dtype: {cfg.bnb_4bit_compute_dtype}")
+                print(f"   • Double quant: {cfg.bnb_4bit_use_double_quant}")
 
-        # Use optimizer-based quantization approach (recommended)
-        if rank == 0:
-            print("   ✅ BitsAndBytes quantization will be applied via AdamW8bit optimizer")
-            print("   ✅ This approach is more stable and memory-efficient")
-            print("   ✅ Expected: ~75% memory reduction during training")
+            # Import and apply quantization
+            from fp4_quant import apply_bnb_4bit
+            try:
+                quantization_success = apply_bnb_4bit(model, cfg)
+            except Exception as e:
+                quantization_success = False
+                if rank == 0:
+                    print_warning(f"⚠️ BitsAndBytes quantization failed: {e}")
+                    print_warning("   Falling back to FP16 training")
 
-    elif cfg.use_fp4:
+            if rank == 0:
+                if quantization_success:
+                    print("   ✅ BitsAndBytes NF4 quantization applied successfully")
+                    print("   ✅ Expected: ~75% memory reduction during training")
+                    print("   ✅ Expected: 2-4x training speedup")
+                else:
+                    print("   ⚠️ BitsAndBytes quantization failed or was skipped, using FP16")
+
+    elif cfg.use_bnb_4bit and not HAS_BNB:
+        if rank == 0:
+            print_warning("⚠️ BitsAndBytes requested but not available")
+            print_warning("   Install with: pip install bitsandbytes")
+            print_warning("   Falling back to FP16 training")
+
+    elif getattr(cfg, 'use_fp4', False):
         # REMOVED: No more fake 4-bit simulation
         if rank == 0:
             print_warning("⚠️ Fake 4-bit disabled. Use use_bnb_4bit=True for real quantization")
@@ -269,12 +318,18 @@ def train():
         if rank == 0:
             print_success("🚀 Using FP16 mixed precision (fastest for RTX 3060 Ti)")
 
-    # Enable gradient checkpointing BEFORE FSDP wrapping
-    if cfg.gradient_checkpointing:
+    # DISABLE gradient checkpointing for bitsandbytes compatibility
+    if cfg.use_bnb_4bit:
+        cfg.gradient_checkpointing = False
+        model.cfg.gradient_checkpointing = False
+        if rank == 0:
+            print("⚠️ Gradient checkpointing disabled for bitsandbytes compatibility")
+    elif cfg.gradient_checkpointing:
         model.cfg.gradient_checkpointing = True
         if rank == 0:
             print("✅ Gradient checkpointing enabled")
 
+    # Continue wrapping and moving model if not already on device
     model = maybe_fsdp_wrap(cfg, model)
     model.to(device)
 
@@ -316,12 +371,24 @@ def train():
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
     logit_constraint = LogitConstraint(cfg.forbidden_tokens, cfg.factual_penalty_weight).to(device)
 
+    # Use explicit GradScaler if available
+    if HAS_AMP and torch.cuda.is_available():
+        scaler = GradScaler(enabled=cfg.amp)
+    else:
+        scaler = None
+
+    # autocast context manager
+    if autocast_cuda is not None:
+        def autocast_ctx(device_type='cuda', enabled=True):
+            return autocast_cuda(device_type=device_type, enabled=enabled)
+    else:
+        autocast_ctx = lambda *a, **k: nullcontext()
+
     optimizer = get_optimizer(cfg, model)
-    scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp and torch.cuda.is_available())
 
     # Data loading with error handling
     try:
-        dl = create_dataloader(cfg, tokenizer, world)
+        dl = create_dataloader(cfg, tokenizer, world, vocab_size=cfg.vocab_size)
         steps_per_epoch = len(dl)
     except Exception as e:
         if rank == 0:
@@ -329,7 +396,18 @@ def train():
             print(f"Check if corpus file exists: {cfg.train_corpus}")
         return
 
-    total_steps = cfg.num_epochs * steps_per_epoch
+    if config_class == SimpleLossDebugConfig:
+        total_steps = 100
+    else:
+        total_steps = cfg.num_epochs * steps_per_epoch
+
+    # SMOKE TEST: limit steps when requested
+    smoke_mode = os.environ.get('SMOKE_TEST', '0') == '1'
+    if smoke_mode:
+        if rank == 0:
+            print("🔬 SMOKE_TEST mode enabled: limiting training to 1 step")
+        total_steps = min(total_steps, 1)
+
     effective_batch_size = cfg.effective_batch_size(world)
 
     if rank == 0:
@@ -368,11 +446,21 @@ def train():
 
     # Save config once
     if rank == 0 and cfg.save_config_once:
-        import json  # Explicit import to avoid scoping issues
         os.makedirs(cfg.ckpt_dir, exist_ok=True)
         with open(os.path.join(cfg.ckpt_dir, 'train_config.json'), 'w') as f:
             json.dump({k: v for k, v in cfg.__dict__.items() if not k.startswith('_')}, f, indent=2)
         print(f"💾 Config saved to {cfg.ckpt_dir}/train_config.json")
+
+    # Initialize advanced loss tracking
+    loss_tracker = LossTracker(save_dir="loss_tracking")
+    loss_tracker.target_steps = total_steps
+    loss_tracker.load_checkpoint()  # Load previous data if exists
+
+    if rank == 0:
+        print_success("📊 Advanced loss tracking initialized")
+        print(f"   • Target steps: {total_steps:,}")
+        print(f"   • Save directory: loss_tracking/")
+        print(f"   • Features: Prediction, convergence detection, visualization")
 
     # Training loop with Rich progress tracking
     accum = 0
@@ -411,11 +499,25 @@ def train():
             x = x.to(device, non_blocking=cfg.pin_memory)
             y = y.to(device, non_blocking=cfg.pin_memory)
 
-            # FIXED: Use new autocast API
-            with torch.amp.autocast('cuda', enabled=cfg.amp and torch.cuda.is_available()):
+            # Debug: print min/max token ids on first step to detect OOB indices
+            if global_step == start_step:
+                try:
+                    xmin = int(x.min().item())
+                    xmax = int(x.max().item())
+                    if rank == 0:
+                        print(f"🔎 Token id range in first batch: min={xmin}, max={xmax}, vocab_size={cfg.vocab_size}")
+                    if xmin < 0 or xmax >= cfg.vocab_size:
+                        if rank == 0:
+                            print_warning("⚠️ Token ids out-of-range detected. Clamping to valid vocab range.")
+                        x = x.clamp(0, cfg.vocab_size - 1)
+                except Exception as e:
+                    if rank == 0:
+                        print_warning(f"Failed to analyze token ids: {e}")
+
+            # FIXED: Use new autocast API and handle scaler properly
+            with autocast_ctx('cuda', enabled=cfg.amp and torch.cuda.is_available()):
                 logits_main, logits_mtp, aux_loss, reason_logits = model(x)
 
-                # FIXED: Apply anti-hallucination BEFORE main loss computation
                 logits_main, penalty = logit_constraint(logits_main)
                 loss_main = criterion(logits_main.view(-1, logits_main.size(-1)), y.view(-1))
 
@@ -443,8 +545,6 @@ def train():
                         for i in range(len(logits_mtp)):
                             print_success(f"   • Head {i}: predicts t+{i+1} with weight {cfg.mtp_loss_weights[i]}")
 
-                # --- END MTP CONFIG PRINTS ---
-
                 # FIXED MTP: Proper multi-token prediction loss computation
                 mtp_loss = torch.zeros((), device=y.device, dtype=loss_main.dtype)
                 for i, mtp_logits in enumerate(logits_mtp):
@@ -461,34 +561,45 @@ def train():
                         mtp_target = y[:, shift:shift+valid_length]  # [B, T-shift]
 
                         # Compute loss only on valid positions
-                        mtp_loss_i = criterion(
-                            mtp_pred.contiguous().view(-1, mtp_pred.size(-1)),
-                            mtp_target.contiguous().view(-1)
-                        )
-                        mtp_loss += cfg.mtp_loss_weights[i] * mtp_loss_i
+                        if mtp_pred.numel() > 0 and mtp_target.numel() > 0:
+                            mtp_loss_i = criterion(
+                                mtp_pred.contiguous().view(-1, mtp_pred.size(-1)),
+                                mtp_target.contiguous().view(-1)
+                            )
+                            mtp_loss += cfg.mtp_loss_weights[i] * mtp_loss_i
 
-                reason_loss = 0.0
+                reason_loss = torch.zeros((), device=y.device, dtype=loss_main.dtype)
                 if reason_logits is not None and cfg.reasoning_loss_weight > 0:
                     target_last = y[:, -1]
                     reason_loss = cfg.reasoning_loss_weight * criterion(reason_logits, target_last)
 
                 aux_t = aux_loss if isinstance(aux_loss, torch.Tensor) else torch.zeros((), device=y.device, dtype=loss_main.dtype)
-            total_loss = loss_main + mtp_loss + aux_t + penalty + reason_loss
+                total_loss = loss_main + mtp_loss + aux_t + penalty + reason_loss
 
-            scaler.scale(total_loss / cfg.grad_accum_steps).backward()
+            # Handle backward pass with proper scaler
+            if scaler is not None:
+                scaler.scale(total_loss / cfg.grad_accum_steps).backward()
+            else:
+                (total_loss / cfg.grad_accum_steps).backward()
+
             accum += 1
 
             # Track individual loss components
             running_loss += loss_main.item()
-            running_mtp_loss += mtp_loss.item() if isinstance(mtp_loss, torch.Tensor) else mtp_loss
-            running_reason_loss += reason_loss.item() if isinstance(reason_loss, torch.Tensor) else reason_loss
-            running_aux_loss += aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss
+            running_mtp_loss += mtp_loss.item() if isinstance(mtp_loss, torch.Tensor) else float(mtp_loss)
+            running_reason_loss += reason_loss.item() if isinstance(reason_loss, torch.Tensor) else float(reason_loss)
+            running_aux_loss += aux_loss.item() if isinstance(aux_loss, torch.Tensor) else float(aux_loss)
 
             if accum % cfg.grad_accum_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+
                 optimizer.zero_grad(set_to_none=True)
 
                 # Learning rate schedule
@@ -498,7 +609,6 @@ def train():
 
                 # Rich logging with beautiful display
                 if (global_step % cfg.log_interval == 0) and (rank == 0):
-                    print(f"[heartbeat] step={global_step}", flush=True)
                     avg_loss = running_loss / cfg.log_interval
                     avg_mtp = running_mtp_loss / cfg.log_interval
                     avg_reason = running_reason_loss / cfg.log_interval
@@ -515,6 +625,18 @@ def train():
                     # Update best loss
                     if avg_loss < best_eval_loss:
                         best_eval_loss = avg_loss
+
+                    # 📊 UPDATE LOSS TRACKER
+                    loss_tracker.update(
+                        step=global_step,
+                        epoch=epoch,
+                        loss=avg_loss,
+                        lr=lr,
+                        main_loss=avg_loss,  # Main component
+                        mtp_loss=avg_mtp,
+                        aux_loss=avg_aux,
+                        reason_loss=avg_reason
+                    )
 
                     # Create metrics object
                     metrics = TrainingMetrics(
@@ -544,6 +666,41 @@ def train():
                     reserved = torch.cuda.memory_reserved()/1e6
                     print_success(f"Memory: Peak {peak:.0f}MB, Reserved {reserved:.0f}MB")
                     torch.cuda.reset_peak_memory_stats()
+
+                # 📊 ADVANCED LOSS ANALYSIS (every 1000 steps)
+                if global_step % 1000 == 0 and rank == 0:
+                    print_success("📊 Generating loss analysis...")
+
+                    # Get current stats
+                    stats = loss_tracker.get_current_stats()
+                    prediction = loss_tracker.predict_final_loss()
+
+                    print(f"🎯 Loss Analysis (Step {global_step:,}):")
+                    print(f"  • Current Loss: {stats['current_loss']:.6f}")
+                    print(f"  • Best Loss: {stats['best_loss']:.6f}")
+                    print(f"  • Moving Average: {stats['moving_average']:.6f}")
+                    print(f"  • Loss Reduction Rate: {stats['loss_reduction_rate']:.8f}/step")
+                    print(f"  • Convergence Progress: {stats['convergence_progress']*100:.1f}%")
+
+                    if prediction['ensemble_prediction'] is not None:
+                        improvement = ((stats['current_loss'] - prediction['ensemble_prediction']) / stats['current_loss'] * 100)
+                        print(f"🔮 Final Loss Prediction:")
+                        print(f"  • Predicted Final Loss: {prediction['ensemble_prediction']:.6f}")
+                        print(f"  • Confidence: {prediction['confidence']*100:.1f}%")
+                        print(f"  • Expected Improvement: {improvement:.1f}%")
+                        print(f"  • Steps Remaining: {prediction['steps_remaining']:,}")
+
+                    # Generate plots
+                    try:
+                        loss_tracker.plot_loss_curves()
+                        print("  ✅ Loss curves updated")
+                    except Exception as e:
+                        print(f"  ⚠️ Plot generation failed: {e}")
+
+                    # Check for convergence
+                    if loss_tracker.is_converged():
+                        print_warning("🎯 Training appears to have converged!")
+                        print_warning("   Consider early stopping to save time")
 
                 # Evaluation with Rich display
                 if global_step % cfg.eval_interval == 0 and (rank == 0):
@@ -605,17 +762,15 @@ def train():
                     print_checkpoint_info(checkpoint_path, global_step, current_loss)
 
             global_step += 1
-            seen_tokens += cfg.seq_len * cfg.micro_batch_size * cfg.grad_accum_steps * world
+            seen_tokens += cfg.seq_len * cfg.micro_batch_size * world
 
-            # Check token budget or step limit
-            if (cfg.target_total_tokens and seen_tokens >= cfg.target_total_tokens) or global_step >= total_steps:
+            # If smoke mode, stop after first step
+            if smoke_mode and global_step >= 1:
                 if rank == 0:
-                    reason = "token budget reached" if seen_tokens >= cfg.target_total_tokens else "step limit reached"
-                    print(f"🏁 Training complete: {reason}")
+                    print("🔬 SMOKE_TEST completed: stopping after 1 step")
                 break
 
-        # Break out of epoch loop if stopping conditions met
-        if (cfg.target_total_tokens and seen_tokens >= cfg.target_total_tokens) or global_step >= total_steps or patience_counter >= cfg.early_stopping_patience:
+        if smoke_mode:
             break
 
     # Final checkpoint
@@ -638,11 +793,42 @@ def train():
         if progress and rank == 0:
             progress.stop()
 
+        # 📊 FINAL LOSS ANALYSIS
+        if rank == 0:
+            print_success("📊 Generating final loss analysis...")
+            final_report = loss_tracker.generate_report()
+            print(final_report)
+
+            # Save final plots
+            loss_tracker.plot_loss_curves()
+
+            # Save final prediction
+            final_prediction = loss_tracker.predict_final_loss()
+            with open(os.path.join(cfg.ckpt_dir, 'final_loss_analysis.json'), 'w') as f:
+                json.dump({
+                    'final_stats': loss_tracker.get_current_stats(),
+                    'final_prediction': final_prediction,
+                    'training_summary': {
+                        'total_steps': global_step,
+                        'total_tokens': seen_tokens,
+                        'best_loss': best_eval_loss,
+                        'final_loss': loss_tracker.losses[-1] if loss_tracker.losses else None,
+                        'converged': loss_tracker.is_converged()
+                    }
+                }, f, indent=2)
+
         print(f"\n🎉 Training Complete!")
         print(f"  Final step: {global_step:,}")
         print(f"  Tokens processed: {seen_tokens/1e6:.1f}M")
         print(f"  Best eval loss: {best_eval_loss:.4f}")
+        if rank == 0 and loss_tracker.losses:
+            print(f"  Final loss: {loss_tracker.losses[-1]:.6f}")
+            if loss_tracker.is_converged():
+                print(f"  ✅ Training converged successfully!")
+            else:
+                print(f"  ⚠️ Training stopped before full convergence")
         print(f"  Models saved in: {cfg.ckpt_dir}")
+        print(f"  Loss analysis saved in: loss_tracking/")
 
         # 🚀 AUTOMATIC MODEL EXPORT FOR ALL DEVICES
         print(f"\n🚀 Starting automatic model export for all devices...")
@@ -693,4 +879,11 @@ def train():
 
 
 if __name__ == '__main__':
-    train()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--debug', action='store_true')
+    args = parser.parse_args()
+    if args.debug:
+        train(config_class=SimpleLossDebugConfig)
+    else:
+        train()

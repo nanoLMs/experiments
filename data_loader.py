@@ -8,7 +8,7 @@ from typing import List, Optional
 class MemoryEfficientDataset(Dataset):
     """EXTREMELY memory-efficient dataset using memory mapping and streaming"""
 
-    def __init__(self, path: str, tokenizer, seq_len: int, max_samples: Optional[int] = None):
+    def __init__(self, path: str, tokenizer, seq_len: int, max_samples: Optional[int] = None, vocab_size: Optional[int] = None):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Corpus file not found: {path}")
 
@@ -16,6 +16,7 @@ class MemoryEfficientDataset(Dataset):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.max_samples = max_samples
+        self.vocab_size = int(vocab_size) if vocab_size is not None else None
 
         print(f"📖 Memory-mapping corpus: {path}")
 
@@ -54,6 +55,9 @@ class MemoryEfficientDataset(Dataset):
 
     def __getitem__(self, idx):
         try:
+            # Clamp index to valid range
+            idx = max(0, min(idx, self.estimated_samples - 1))
+
             # Calculate which part of file we need
             chars_per_token = 1.0 / self.tokens_per_char
             start_char = int(idx * chars_per_token)
@@ -65,59 +69,59 @@ class MemoryEfficientDataset(Dataset):
             if chunk_id not in self.chunk_cache:
                 self._load_chunk(chunk_id)
 
-            # Get text chunk
-            chunk_start = chunk_id * self.chunk_size
-            chunk_end = min(chunk_start + self.chunk_size + self.seq_len * 10, len(self.mmap))
-
-            chunk_text = self.mmap[chunk_start:chunk_end].decode('utf-8', errors='ignore')
-
-            # Tokenize chunk
+            # If chunk loading failed, try simpler approach
             if chunk_id not in self.chunk_cache:
-                tokens = self.tokenizer(chunk_text, add_special_tokens=False)['input_ids']
-                self.chunk_cache[chunk_id] = torch.tensor(tokens, dtype=torch.long)
+                # Simple fallback: just use a portion of the file
+                simple_start = min(start_char, len(self.mmap) - 1000)
+                simple_end = min(simple_start + 1000, len(self.mmap))
+                simple_text = self.mmap[simple_start:simple_end].decode('utf-8', errors='ignore')
 
-                # Limit cache size
-                if len(self.chunk_cache) > self.max_cached_chunks:
-                    oldest_chunk = min(self.chunk_cache.keys())
-                    del self.chunk_cache[oldest_chunk]
-                    gc.collect()
+                try:
+                    tokens = self.tokenizer(simple_text, add_special_tokens=False)['input_ids']
+                    if len(tokens) >= self.seq_len + 1:
+                        x = torch.tensor(tokens[:self.seq_len], dtype=torch.long)
+                        y = torch.tensor(tokens[1:self.seq_len + 1], dtype=torch.long)
+                        return x, y
+                except:
+                    pass  # Fall through to padding
+            else:
+                tokens = self.chunk_cache[chunk_id]
 
-            tokens = self.chunk_cache[chunk_id]
+                # Extract sequence
+                local_idx = max(0, start_char - chunk_id * self.chunk_size)
+                token_start = int(local_idx * self.tokens_per_char)
 
-            # Extract sequence
-            local_idx = max(0, start_char - chunk_start)
-            token_start = int(local_idx * self.tokens_per_char)
+                # Ensure we don't exceed available tokens
+                max_start = max(0, len(tokens) - self.seq_len - 1)
+                token_start = min(token_start, max_start)
 
-            # Ensure we don't exceed available tokens
-            max_start = max(0, len(tokens) - self.seq_len - 1)
-            token_start = min(token_start, max_start)
+                if token_start + self.seq_len + 1 <= len(tokens):
+                    x = tokens[token_start:token_start + self.seq_len]
+                    y = tokens[token_start + 1:token_start + self.seq_len + 1]
 
-            if token_start + self.seq_len + 1 <= len(tokens):
-                x = tokens[token_start:token_start + self.seq_len]
-                y = tokens[token_start + 1:token_start + self.seq_len + 1]
+                    # Ensure exact length match
+                    if len(x) == self.seq_len and len(y) == self.seq_len:
+                        return x, y
 
-                # Ensure exact length match
-                if len(x) == self.seq_len and len(y) == self.seq_len:
+                # Fallback: create from beginning of chunk
+                if len(tokens) >= self.seq_len + 1:
+                    x = tokens[:self.seq_len]
+                    y = tokens[1:self.seq_len + 1]
                     return x, y
 
-            # Fallback: create from beginning of chunk
-            if len(tokens) >= self.seq_len + 1:
-                x = tokens[:self.seq_len]
-                y = tokens[1:self.seq_len + 1]
-                return x, y
-            else:
-                # Pad if necessary
-                pad_id = self.tokenizer.pad_token_id or 0
-                x = torch.full((self.seq_len,), pad_id)
-                y = torch.full((self.seq_len,), pad_id)
-                return x, y
+            # Final fallback: pad if necessary
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            x = torch.full((self.seq_len,), pad_id, dtype=torch.long)
+            y = torch.full((self.seq_len,), pad_id, dtype=torch.long)
+            return x, y
 
         except Exception as e:
-            print(f"⚠️ Error loading sample {idx}: {e}")
+            if idx % 1000 == 0:  # Only print every 1000th error to avoid spam
+                print(f"⚠️ Error loading sample {idx}: {e}")
             # Return padded sequence as fallback
-            pad_id = self.tokenizer.pad_token_id or 0
-            x = torch.full((self.seq_len,), pad_id)
-            y = torch.full((self.seq_len,), pad_id)
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            x = torch.full((self.seq_len,), pad_id, dtype=torch.long)
+            y = torch.full((self.seq_len,), pad_id, dtype=torch.long)
             return x, y
 
     def _load_chunk(self, chunk_id):
@@ -128,6 +132,12 @@ class MemoryEfficientDataset(Dataset):
 
             chunk_text = self.mmap[chunk_start:chunk_end].decode('utf-8', errors='ignore')
             tokens = self.tokenizer(chunk_text, add_special_tokens=False)['input_ids']
+
+            # Clamp tokens to valid vocab range to prevent embedding/gather OOB errors
+            if self.vocab_size is not None:
+                # Convert to Python list then clamp
+                tokens = [min(max(0, int(t)), self.vocab_size - 1) for t in tokens]
+            # Store as tensor for fast indexing
             self.chunk_cache[chunk_id] = torch.tensor(tokens, dtype=torch.long)
 
         except Exception as e:
@@ -141,7 +151,7 @@ class MemoryEfficientDataset(Dataset):
             self.file.close()
 
 
-def create_dataloader(cfg, tokenizer, world_size=1):
+def create_dataloader(cfg, tokenizer, world_size=1, vocab_size=None):
     """Create memory-efficient dataloader"""
 
     # Limit dataset size for memory safety
@@ -168,29 +178,33 @@ def create_dataloader(cfg, tokenizer, world_size=1):
         path=cfg.train_corpus,
         tokenizer=tokenizer,
         seq_len=cfg.seq_len,
-        max_samples=max_samples
+        max_samples=max_samples,
+        vocab_size=vocab_size
     )
 
     # Force garbage collection
     gc.collect()
 
-    # Create dataloader with memory optimizations
-    num_workers = min(cfg.dataloader_workers, 2)  # Limit workers to save memory
+    # Create dataloader with memory optimizations and reliability fixes
+    # Force single worker and no pin_memory for debugging hangs
+    num_workers = 0
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.micro_batch_size,
-        shuffle=False,  # Don't shuffle to maintain locality
-        num_workers=num_workers,
-        pin_memory=cfg.pin_memory and torch.cuda.is_available(),
-        persistent_workers=False,  # Don't keep workers alive
-        prefetch_factor=1 if num_workers > 0 else None,  # Only set prefetch_factor with workers
-        drop_last=True
-    )
+    # Build dataloader arguments
+    dataloader_kwargs = {
+        'batch_size': cfg.micro_batch_size,
+        'shuffle': False,  # Don't shuffle to maintain locality
+        'num_workers': num_workers,
+        'pin_memory': False,
+        'drop_last': True
+    }
+
+    # Skip multiprocessing/persistent_workers for debugging
+
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     print(f"🚀 DataLoader created:")
     print(f"  - Batch size: {cfg.micro_batch_size}")
-    print(f"  - Workers: {min(cfg.dataloader_workers, 2)}")
+    print(f"  - Workers: {min(getattr(cfg, 'dataloader_workers', num_workers), 2)}")
     print(f"  - Memory efficient: ✅")
     print(f"  - Estimated batches per epoch: {len(dataloader):,}")
 

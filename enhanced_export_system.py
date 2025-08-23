@@ -20,21 +20,20 @@ from pathlib import Path
 import json
 import time
 import shutil
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 from model_moe import NanoMoEModel
 from config import TrainConfig
+from config_simple_loss_debug import SimpleLossDebugConfig
 from rich_output import print_success, print_error, print_warning
 
 class EnhancedModelExporter:
     """Enhanced exporter with device-specific optimizations."""
 
-    def __init__(self, checkpoint_path: str, output_dir: str = "exported_models"):
+    def __init__(self, checkpoint_path: str, output_dir: str = "exported_models", config_class: Type[TrainConfig] = TrainConfig):
         self.checkpoint_path = checkpoint_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-
-        # Load model
-        self.cfg = TrainConfig()
+        self.cfg = config_class()
         self.model = NanoMoEModel(self.cfg)
 
         # Load weights
@@ -863,24 +862,25 @@ Each platform folder contains detailed integration guides:
         print(f"📋 See DEPLOYMENT_GUIDE.md for detailed instructions")
 
 
-def enhanced_export_after_training(checkpoint_path: str, output_dir: str = "exported_models"):
+def enhanced_export_after_training(checkpoint_path: str, output_dir: str = "exported_models", config_class: Type[TrainConfig] = TrainConfig):
     """Enhanced export function to be called after training."""
-    exporter = EnhancedModelExporter(checkpoint_path, output_dir)
+    exporter = EnhancedModelExporter(checkpoint_path, output_dir, config_class)
     return exporter.export_all_devices()
 
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        print("❌ Usage: python enhanced_export_system.py <checkpoint_path> [output_dir]")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("checkpoint_path", type=str)
+    parser.add_argument("output_dir", type=str, nargs="?", default="exported_models")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.checkpoint_path):
+        print(f"❌ Checkpoint not found: {args.checkpoint_path}")
         sys.exit(1)
 
-    checkpoint_path = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "exported_models"
-
-    if not os.path.exists(checkpoint_path):
-        print(f"❌ Checkpoint not found: {checkpoint_path}")
-        sys.exit(1)
-
-    enhanced_export_after_training(checkpoint_path, output_dir)
+    config_class = SimpleLossDebugConfig if args.debug else TrainConfig
+    enhanced_export_after_training(args.checkpoint_path, args.output_dir, config_class)
